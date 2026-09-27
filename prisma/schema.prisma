@@ -1,0 +1,351 @@
+// Local Lead Intelligence — Phase 1 schema
+// Normalized relational design per build spec.
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+// ── Enums ────────────────────────────────────────────────────────────
+
+// Every fact in this system is tagged with how sure we are of it.
+// The AI layer is never allowed to present INFERRED as VERIFIED.
+enum DataConfidence {
+  VERIFIED     // Directly returned by a trusted data provider or observed on a live crawl
+  OBSERVED     // Directly observed by our own crawler/audit, not provider-confirmed
+  INFERRED     // Derived/estimated by our logic or an LLM from other data
+  NOT_VERIFIED // Could not be confirmed; must render as "NOT VERIFIED" in UI
+}
+
+enum DataSource {
+  MOCK
+  GOOGLE_PLACES
+  YELP_FUSION
+  MANUAL
+  OTHER
+}
+
+enum LeadStatus {
+  NEW
+  QUEUED_FOR_AUDIT
+  AUDITED
+  QUALIFIED
+  CONTACTED
+  RESPONDED
+  WON
+  LOST
+  DISQUALIFIED
+}
+
+enum AuditRunStatus {
+  PENDING
+  RUNNING
+  COMPLETE
+  FAILED
+  SKIPPED_NOT_PERMITTED // robots.txt / ToS disallowed the crawl
+}
+
+enum FindingCategory {
+  TECHNICAL_SEO
+  ON_PAGE_SEO
+  LOCAL_SEO
+  CONTENT
+  CONVERSION
+  MOBILE_UX
+  SCHEMA
+  METADATA
+  ACCESSIBILITY
+}
+
+enum FindingSeverity {
+  LOW
+  MEDIUM
+  HIGH
+  CRITICAL
+}
+
+enum ContactChannel {
+  EMAIL
+  PHONE
+  WHATSAPP
+  CONTACT_FORM
+  SOCIAL
+}
+
+enum ProposalStatus {
+  DRAFT
+  EDITED
+  APPROVED
+  SENT
+  ARCHIVED
+}
+
+// ── Auth (NextAuth-compatible) ──────────────────────────────────────
+
+model User {
+  id            String    @id @default(cuid())
+  name          String?
+  email         String    @unique
+  emailVerified DateTime?
+  image         String?
+  passwordHash  String? // set only for credentials-based accounts
+  createdAt     DateTime  @default(now())
+  updatedAt     DateTime  @updatedAt
+
+  accounts Account[]
+  sessions Session[]
+  searches Search[]
+  notes    Note[]
+
+  @@index([email])
+}
+
+model Account {
+  id                String  @id @default(cuid())
+  userId            String
+  type              String
+  provider          String
+  providerAccountId String
+  refresh_token     String? @db.Text
+  access_token      String? @db.Text
+  expires_at        Int?
+  token_type        String?
+  scope             String?
+  id_token          String? @db.Text
+  session_state     String?
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@unique([provider, providerAccountId])
+}
+
+model Session {
+  id           String   @id @default(cuid())
+  sessionToken String   @unique
+  userId       String
+  expires      DateTime
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+}
+
+model VerificationToken {
+  identifier String
+  token      String   @unique
+  expires    DateTime
+
+  @@unique([identifier, token])
+}
+
+// ── Core domain ──────────────────────────────────────────────────────
+
+// One user-initiated discovery run: "dental clinics" in "Hattiesburg, MS" within 25 miles.
+model Search {
+  id        String   @id @default(cuid())
+  userId    String
+  keyword   String
+  location  String
+  radiusMi  Int
+  source    DataSource @default(MOCK)
+  resultCount Int      @default(0)
+  createdAt DateTime @default(now())
+
+  user      User       @relation(fields: [userId], references: [id], onDelete: Cascade)
+  businesses SearchResult[]
+
+  @@index([userId, createdAt])
+}
+
+// Join table: which businesses came back for which search (a business can surface in many searches).
+model SearchResult {
+  id         String   @id @default(cuid())
+  searchId   String
+  businessId String
+  rank       Int?
+  createdAt  DateTime @default(now())
+
+  search   Search   @relation(fields: [searchId], references: [id], onDelete: Cascade)
+  business Business @relation(fields: [businessId], references: [id], onDelete: Cascade)
+
+  @@unique([searchId, businessId])
+}
+
+// The normalized, deduplicated business record. Deduplication key is (source, sourceBusinessId).
+model Business {
+  id               String   @id @default(cuid())
+  name             String
+  category         String?
+  source           DataSource @default(MOCK)
+  sourceBusinessId String   // provider's own ID — used for dedup on ingest
+  sourceConfidence DataConfidence @default(NOT_VERIFIED)
+
+  phone            String?
+  websiteUrl       String?
+  rating           Float?
+  reviewCount      Int?
+
+  status           LeadStatus @default(NEW)
+
+  lastCheckedAt    DateTime?
+  createdAt        DateTime @default(now())
+  updatedAt        DateTime @updatedAt
+
+  location         BusinessLocation?
+  website          Website?
+  contacts         Contact[]
+  auditRuns        AuditRun[]
+  scores           Score[]
+  proposals        Proposal[]
+  notes            Note[]
+  searchResults    SearchResult[]
+
+  @@unique([source, sourceBusinessId])
+  @@index([name])
+  @@index([status])
+}
+
+model BusinessLocation {
+  id         String  @id @default(cuid())
+  businessId String  @unique
+  address    String?
+  city       String?
+  state      String?
+  postalCode String?
+  latitude   Float?
+  longitude  Float?
+  hoursJson  Json?   // structured hours if the provider returns them; null if unknown
+  confidence DataConfidence @default(NOT_VERIFIED)
+
+  business Business @relation(fields: [businessId], references: [id], onDelete: Cascade)
+
+  @@index([city, state])
+}
+
+// One website per business (Phase 1 assumption). Crawl metadata lives here.
+model Website {
+  id              String   @id @default(cuid())
+  businessId      String   @unique
+  url             String
+  crawlAllowed    Boolean  @default(false) // robots.txt permission result
+  lastCrawledAt   DateTime?
+  crawlStatusNote String? // e.g. "disallowed by robots.txt", "timeout", "ok"
+
+  business  Business   @relation(fields: [businessId], references: [id], onDelete: Cascade)
+  auditRuns AuditRun[]
+
+  @@index([businessId])
+}
+
+// One execution of the audit pipeline against a business/website.
+model AuditRun {
+  id         String         @id @default(cuid())
+  businessId String
+  websiteId  String?
+  status     AuditRunStatus @default(PENDING)
+  startedAt  DateTime       @default(now())
+  finishedAt DateTime?
+  errorMessage String?
+
+  business Business @relation(fields: [businessId], references: [id], onDelete: Cascade)
+  website  Website? @relation(fields: [websiteId], references: [id], onDelete: SetNull)
+
+  findings AuditFinding[]
+  scores   Score[]
+
+  @@index([businessId, startedAt])
+}
+
+// A single, evidenced audit finding. Never freeform sales copy — always traceable evidence.
+model AuditFinding {
+  id          String          @id @default(cuid())
+  auditRunId  String
+  category    FindingCategory
+  title       String
+  description String
+  severity    FindingSeverity
+  evidence    String          // what was actually observed, and where
+  sourceUrl   String?         // page the evidence was observed on, if applicable
+  confidence  DataConfidence  @default(OBSERVED)
+  verified    Boolean         @default(false)
+  recommendation String
+
+  createdAt DateTime @default(now())
+
+  auditRun AuditRun @relation(fields: [auditRunId], references: [id], onDelete: Cascade)
+
+  @@index([auditRunId, category])
+}
+
+// Snapshot of computed scores for one audit run. Kept versioned/historical rather than mutated in place.
+model Score {
+  id         String   @id @default(cuid())
+  businessId String
+  auditRunId String?
+
+  profileScore    Int // 0-100, based on provider profile signals (rating, reviews, category coverage)
+  websiteSeoScore Int
+  technicalSeoScore Int
+  localSeoScore   Int
+  contentScore    Int
+  conversionScore Int
+  opportunityScore Int // derived composite — see src/lib/scoring
+
+  explanation Json // structured breakdown of which signals produced which score — "show WHY"
+
+  createdAt DateTime @default(now())
+
+  business Business  @relation(fields: [businessId], references: [id], onDelete: Cascade)
+  auditRun AuditRun? @relation(fields: [auditRunId], references: [id], onDelete: SetNull)
+
+  @@index([businessId, createdAt])
+}
+
+model Contact {
+  id         String         @id @default(cuid())
+  businessId String
+  channel    ContactChannel
+  value      String         // email address, phone number, form URL, etc.
+  confidence DataConfidence @default(NOT_VERIFIED)
+  sourceUrl  String?        // where this contact point was observed
+  createdAt  DateTime       @default(now())
+
+  business Business @relation(fields: [businessId], references: [id], onDelete: Cascade)
+
+  @@index([businessId, channel])
+}
+
+model Proposal {
+  id          String         @id @default(cuid())
+  businessId  String
+  status      ProposalStatus @default(DRAFT)
+
+  subject     String
+  opening     String
+  observations Json          // array of {text, findingId} — every observation must reference a real finding
+  solution    String
+  cta         String
+  signature   String
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  business Business @relation(fields: [businessId], references: [id], onDelete: Cascade)
+
+  @@index([businessId, status])
+}
+
+model Note {
+  id         String   @id @default(cuid())
+  businessId String
+  userId     String
+  body       String
+  createdAt  DateTime @default(now())
+
+  business Business @relation(fields: [businessId], references: [id], onDelete: Cascade)
+  user     User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([businessId, createdAt])
+}
